@@ -1,34 +1,59 @@
-FROM ubuntu:16.04
+# First of all, build frontend with NodeJS in a separate builder container
+# Node-6 with ABI v48 is supported by all needed C++ packages
+FROM node:6 AS node-builder
 
-ENV PG_MAJOR 9.6
-ENV PG_VERSION 9.6.1
-ENV PG_SHA256 e5101e0a49141fc12a7018c6dad594694d3a3325f5ab71e93e0e51bd94e51fcd
+COPY ./pgadmin4/web/ /pgadmin4/web/
+WORKDIR /pgadmin4/web
 
-COPY entrypoint.sh /
+RUN yarn install --cache-folder ./ycache --verbose && \
+    yarn run bundle && \
+    rm -rf ./ycache ./pgadmin/static/js/generated/.cache
 
-RUN apt-get update
-RUN apt-get install -y wget lbzip2 gcc libreadline6-dev  zlib1g-dev libssl-dev libxml2  \
-    libxml2-dev libxslt1.1 libxslt1-dev uuid uuid-dev perl make pax-utils
-RUN wget -O postgresql.tar.bz2 "https://ftp.postgresql.org/pub/source/v$PG_VERSION/postgresql-$PG_VERSION.tar.bz2" && \
-    mkdir -p /usr/src/postgresql && \
-    tar --extract --file postgresql.tar.bz2 --directory /usr/src/postgresql --strip-components 1 && \
-    rm postgresql.tar.bz2 && \
-    cd /usr/src/postgresql && \
-     ./configure --enable-integer-datetimes --enable-thread-safety  --enable-tap-tests  --disable-rpath --with-uuid=e2fs \
-     --with-gnu-ld  --with-pgport=5432 --with-system-tzdata=/usr/share/zoneinfo --prefix=/usr/local --with-openssl \
-     --with-libxml --with-libxslt && \
-     make -j "$(getconf _NPROCESSORS_ONLN)" world && \
-	  make install-world && \
-     make -C contrib install && \
-     cd / && \
-	  rm -rf /usr/src/postgresql \
-	      /usr/local/include/* \
-	      /usr/local/share/doc \
-		   /usr/local/share/man && \
-     mkdir -p /var/run/postgresql && \
-     useradd postgres && \
-     chown -R postgres /var/run/postgresql
-     
-EXPOSE 5432
+# Build Sphinx documentation in separate container
+FROM python:3.6-alpine3.7 as docs-builder
+
+# Install only dependencies absolutely required for documentation building
+RUN apk add --no-cache make
+RUN pip install --no-cache-dir \
+    sphinx flask_security flask_paranoid python-dateutil flask_sqlalchemy \
+    flask_gravatar simplejson
+
+COPY ./pgadmin4/ /pgadmin4
+
+RUN LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 make -C /pgadmin4/docs/en_US -f Makefile.sphinx html
+
+# Then install backend, copy static files and set up entrypoint
+# Need alpine3.7 to get pg_dump and friends in postgresql-client package
+FROM python:3.6-alpine3.7
+
+RUN pip --no-cache-dir install gunicorn
+RUN apk add --no-cache postgresql-client postgresql-libs
+
+WORKDIR /pgadmin4
+ENV PYTHONPATH=/pgadmin4
+
+# Install build-dependencies, build & install C extensions and purge deps in one RUN step
+# so that deps do not increase the size of resulting image by remaining in layers
+COPY ./pgadmin4/requirements.txt /pgadmin4
+RUN set -ex && \
+    apk add --no-cache --virtual build-deps build-base postgresql-dev libffi-dev && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apk del --no-cache build-deps
+
+COPY --from=node-builder /pgadmin4/web/pgadmin/static/js/generated/ /pgadmin4/pgadmin/static/js/generated/
+COPY --from=docs-builder /pgadmin4/docs/en_US/_build/html/ /pgadmin4/docs/
+
+COPY ./pgadmin4/web /pgadmin4
+COPY ./run_pgadmin.py /pgadmin4
+COPY ./config_distro.py /pgadmin4
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Precompile and optimize python code to save time and space on startup
+RUN python -O -m compileall /pgadmin4
+
+COPY ./entrypoint.sh /entrypoint.sh
+
+EXPOSE 80 443
 
 ENTRYPOINT ["/entrypoint.sh"]
