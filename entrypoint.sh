@@ -1,26 +1,26 @@
-#!/bin/sh
+#!/bin/bash
+export USER_ID=${DATA_USER_ID:-1000}
+export GROUP_ID=${DATA_GROUP_ID:-1000}
 
-if [ ! -f /var/lib/pgadmin/pgadmin4.db ]; then
-    if [ -z "${PGADMIN_DEFAULT_EMAIL}" -o -z "${PGADMIN_DEFAULT_PASSWORD}" ]; then
-        echo 'You need to specify PGADMIN_DEFAULT_EMAIL and PGADMIN_DEFAULT_PASSWORD environment variables'
-        exit 1
-    fi
+#Link configuration volume
+mkdir -p /pgadmin-data
+ln -s /pgadmin-data /root/.pgadmin
+chmod a+x /root
 
-    # Set the default username and password in a
-    # backwards compatible way
-    export PGADMIN_SETUP_EMAIL=${PGADMIN_DEFAULT_EMAIL}
-    export PGADMIN_SETUP_PASSWORD=${PGADMIN_DEFAULT_PASSWORD}
+#Create unprivileged user
+groupadd -g $GROUP_ID -o pgadmin
+useradd --shell /usr/sbin/nologin -u $USER_ID -o -c "" -g $GROUP_ID pgadmin --home /pgadmin-data
+chown pgadmin:pgadmin /pgadmin-data
 
-    # Initialize DB before starting Gunicorn
-    # Importing pgadmin4 (from this script) is enough
-    python run_pgadmin.py
+#Create persistent config file on volume
+if [ ! -f /pgadmin-data/config_local.py ]; then
+  cat /pgadmin4/web/config.py  \
+     | sed "s/DEFAULT_SERVER = 'localhost'/DEFAULT_SERVER = '0.0.0.0'/" \
+     > /pgadmin-data/config_local.py
+  chown pgadmin:pgadmin /pgadmin-data/config_local.py
 fi
+ln -s /pgadmin-data/config_local.py /pgadmin4/web/config_local.py
 
-# NOTE: currently pgadmin can run only with 1 worker due to sessions implementation
-# Using --threads to have multi-threaded single-process worker
 
-if [ ! -z ${PGADMIN_ENABLE_TLS} ]; then
-    exec gunicorn --bind [::]:${PGADMIN_LISTEN_PORT:-443} -w 1 --threads ${GUNICORN_THREADS:-25} --access-logfile - --keyfile /certs/server.key --certfile /certs/server.cert run_pgadmin:app
-else
-    exec gunicorn --bind [::]:${PGADMIN_LISTEN_PORT:-80} -w 1 --threads ${GUNICORN_THREADS:-25} --access-logfile - run_pgadmin:app
-fi
+#Run unprivileged
+chroot --userspec pgadmin:pgadmin / python3 pgadmin4/web/pgAdmin4.py
