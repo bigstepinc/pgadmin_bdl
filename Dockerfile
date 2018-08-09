@@ -1,59 +1,18 @@
-# First of all, build frontend with NodeJS in a separate builder container
-# Node-6 with ABI v48 is supported by all needed C++ packages
-FROM node:6 AS node-builder
+FROM debian:jessie-backports
+ENV DEBIAN_FRONTEND=noninteractive
 
-COPY ./pgadmin4/web/ /pgadmin4/web/
-WORKDIR /pgadmin4/web
+RUN \
+   export DEBIAN_FRONTEND=noninteractive \
+   && apt-get -qy update && apt-get -qy dist-upgrade \
+   && apt-get -qy install  --no-install-recommends python3 python3-pip libpq5 libpq-dev build-essential libpython3-all-dev git \
+   && git clone --depth=1 --branch=master git://git.postgresql.org/git/pgadmin4.git \
+   && rm -rf pgadmin4/.git \
+   && pip3 install -r pgadmin4/requirements_py3.txt \
+   && apt-get -qy purge libpq-dev build-essential libpython3-all-dev git \
+   && apt-get -qy --purge autoremove && apt-get -qy clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
+   && rm -rf /usr/share/doc /usr/share/doc-base /usr/share/man /usr/share/locale /usr/share/zoneinfo
 
-RUN yarn install --cache-folder ./ycache --verbose && \
-    yarn run bundle && \
-    rm -rf ./ycache ./pgadmin/static/js/generated/.cache
+EXPOSE 5050
 
-# Build Sphinx documentation in separate container
-FROM python:3.6-alpine3.7 as docs-builder
-
-# Install only dependencies absolutely required for documentation building
-RUN apk add --no-cache make
-RUN pip install --no-cache-dir \
-    sphinx flask_security flask_paranoid python-dateutil flask_sqlalchemy \
-    flask_gravatar simplejson
-
-COPY ./pgadmin4/ /pgadmin4
-
-RUN LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 make -C /pgadmin4/docs/en_US -f Makefile.sphinx html
-
-# Then install backend, copy static files and set up entrypoint
-# Need alpine3.7 to get pg_dump and friends in postgresql-client package
-FROM python:3.6-alpine3.7
-
-RUN pip --no-cache-dir install gunicorn
-RUN apk add --no-cache postgresql-client postgresql-libs
-
-WORKDIR /pgadmin4
-ENV PYTHONPATH=/pgadmin4
-
-# Install build-dependencies, build & install C extensions and purge deps in one RUN step
-# so that deps do not increase the size of resulting image by remaining in layers
-COPY ./pgadmin4/requirements.txt /pgadmin4
-RUN set -ex && \
-    apk add --no-cache --virtual build-deps build-base postgresql-dev libffi-dev && \
-    pip install --no-cache-dir -r requirements.txt && \
-    apk del --no-cache build-deps
-
-COPY --from=node-builder /pgadmin4/web/pgadmin/static/js/generated/ /pgadmin4/pgadmin/static/js/generated/
-COPY --from=docs-builder /pgadmin4/docs/en_US/_build/html/ /pgadmin4/docs/
-
-COPY ./pgadmin4/web /pgadmin4
-COPY ./run_pgadmin.py /pgadmin4
-COPY ./config_distro.py /pgadmin4
-
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Precompile and optimize python code to save time and space on startup
-RUN python -O -m compileall /pgadmin4
-
-COPY ./entrypoint.sh /entrypoint.sh
-
-EXPOSE 80 443
-
-ENTRYPOINT ["/entrypoint.sh"]
+ADD entrypoint.sh /
+ENTRYPOINT ["./entrypoint.sh"]
